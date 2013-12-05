@@ -5,9 +5,6 @@ from ..graph.dijkstra import DijkstraNode, find_shortest_paths
 from .network import Network
 
 
-PARAM_UPLINKS = 'uplinks'
-
-
 """
 A network of switches that routes traffic along a spanning tree.
 """
@@ -15,25 +12,19 @@ class SpanningTreeNetwork(Network):
 
   logger = core.getLogger()
 
-  def __init__(self, params):
+  def __init__(self):
     self.root = None
-    self._parse_config(params)
     super(SpanningTreeNetwork, self).__init__()
 
 
   def _create_node(self, connect_event):
-    switch = LldpSwitch(connect_event, self._arp_table)
-    switch.addListenerByName('LinkDiscoveryEvent', self._handle_switch_LinkDiscoveryEvent)
-    switch.addListenerByName('UnknownPacketSourceEvent', self._handle_switch_UnknownPacketSourceEvent)
-    return switch
+    return LldpSwitch(connect_event, self._arp_table)
 
 
-  def _parse_config(self, params):
-    uplink_str = params.get(PARAM_UPLINKS)
-    if uplink_str:
-      self._uplinks = [tuple(x.split(',')) for x in uplink_str.split(';')]
-    else:
-      self._uplinks = []
+  def _initialize_node(self, node):
+    super(SpanningTreeNetwork, self)._initialize_node(node)
+    node.addListenerByName('LinkDiscoveryEvent', self._handle_switch_LinkDiscoveryEvent)
+    node.addListenerByName('UnknownPacketSourceEvent', self._handle_switch_UnknownPacketSourceEvent)
 
 
   def _rebuild_spanning_tree(self, start = None):
@@ -50,7 +41,7 @@ class SpanningTreeNetwork(Network):
 
       # Add all switches this node is linked to, except those that we have
       # initialized.
-      links = filter(lambda x: (switch.dpid, x.port) not in self._uplinks and x.switch not in added, switch.links)
+      links = filter(lambda x: x.switch not in added, switch.links)
       switches.extend([ x.switch for x in links ])
       i += 1
 
@@ -153,6 +144,6 @@ Invoked by POX when SpanningTreeNetwork is specified as a module on the command 
   $ ./pox csep561.net.spanning_tree_network
 """
 def launch(**params):
-  network = SpanningTreeNetwork(params)
+  network = SpanningTreeNetwork()
   core.register('spanning_tree_network', network)
 

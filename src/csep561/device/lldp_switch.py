@@ -42,9 +42,9 @@ class LldpSwitch(LearningSwitch, EventMixin):
   def _activate(self):
     super(LldpSwitch, self)._activate()
 
-    # Disable flooding on all links, so we don't spam packets all over the network.
-    # We will activate them as we learn about topology.
-    for port in self.get_ports():
+    # Disable flooding on all link ports, so we don't spam packets all over the
+    # network. We will activate them as we learn about topology.
+    for port in self._get_discoverable_ports():
       self.set_flood_status(port.port_no, False)
 
     # Start learning about our neighbors.
@@ -61,7 +61,7 @@ class LldpSwitch(LearningSwitch, EventMixin):
     # Send an LLDP packet to discover switch links.  LLDP lets us include the switch
     # and port identity on this side, so when we receive the packet on the other
     # side we know about both ends of the link.
-    for port in self.get_ports():
+    for port in self._get_discoverable_ports():
       LldpSwitch.logger.debug('Discovering neighbors on switch {} port {}.'.format(self.dpid, port.port_no))
       lldp_pkt = pkt.lldp()
       lldp_pkt.add_tlv(pkt.chassis_id(subtype = pkt.chassis_id.SUB_MAC, id = port.hw_addr.toRaw()))
@@ -77,6 +77,16 @@ class LldpSwitch(LearningSwitch, EventMixin):
 
 
   """
+  Gets the list of ports through which we can attempt to discover neighbors.
+  Basically, the "internal network" ports.
+
+  This may be overridden by subclasses that define an "uplink" port.
+  """
+  def _get_discoverable_ports(self):
+    return self.get_ports()
+
+
+  """
   Activates flooding on ports that do NOT have links, since they might have hosts.
   """
   def _activate_host_ports(self):
@@ -89,16 +99,20 @@ class LldpSwitch(LearningSwitch, EventMixin):
   def _handle_lldp(self, event, ether_pkt, lldp_pkt):
     if len(lldp_pkt.tlvs) >= 4 and lldp_pkt.tlvs[1].tlv_type == pkt.lldp.PORT_ID_TLV and lldp_pkt.tlvs[1].subtype == pkt.port_id.SUB_PORT and lldp_pkt.tlvs[3].tlv_type == pkt.lldp.SYSTEM_DESC_TLV:
       local_port = event.ofp.in_port
-      remote_port = int(lldp_pkt.tlvs[1].id)
-      remote_dpid = int(lldp_pkt.tlvs[3].payload)
-      self._packet_logger.action('LinkDiscoveryEvent', [
-        ('Local Switch', self.dpid),
-        ('Local Port', local_port),
-        ('Remote Switch', remote_dpid),
-        ('Remote Port', remote_port)
-      ])
-      self.raiseEvent(LinkDiscoveryEvent, self, local_port, remote_dpid, remote_port)
-      return True
+      for port in self._get_discoverable_ports():
+        # Only react to link discovery packets if the port is a "discoverable" port.
+        # Our network topology stops at uplink ports.
+        if port.port_no == local_port:
+          remote_port = int(lldp_pkt.tlvs[1].id)
+          remote_dpid = int(lldp_pkt.tlvs[3].payload)
+          self._packet_logger.action('LinkDiscoveryEvent', [
+            ('Local Switch', self.dpid),
+            ('Local Port', local_port),
+            ('Remote Switch', remote_dpid),
+            ('Remote Port', remote_port)
+          ])
+          self.raiseEvent(LinkDiscoveryEvent, self, local_port, remote_dpid, remote_port)
+          return True
 
     return super(LldpSwitch, self)._handle_lldp(event, ether_pkt, lldp_pkt)
 

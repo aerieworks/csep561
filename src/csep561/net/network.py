@@ -32,6 +32,13 @@ class Network(EventMixin):
 
 
   """
+  Initializes a new network node.
+  """
+  def _initialize_node(self, node):
+    pass
+
+
+  """
   Cleans up the specified node after removal from the network.
   """
   def _clean_up_node(self, node):
@@ -43,6 +50,7 @@ class Network(EventMixin):
   """
   def _handle_ConnectionUp(self, event):
     node = self._create_node(event)
+    self._initialize_node(node)
     self._nodes[node.dpid] = node
 
 
