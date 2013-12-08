@@ -1,6 +1,11 @@
 from datetime import datetime
+from time import time
 
 from pox.lib.packet import arp, chassis_id, ethernet, ipv4, lldp, port_id
+
+def _format_metric_name(name):
+  return '{:<20}'.format(name + ':')
+
 
 class PacketLogger:
 
@@ -17,6 +22,10 @@ class PacketLogger:
   }
 
   def __init__(self, file_name):
+    self._start_time = time()
+    self._metrics = {}
+    self._metrics_order = []
+    self._is_in_packet = False
     self._is_open = False
     self._out = open(file_name, 'a')
     self._is_open = True
@@ -33,10 +42,18 @@ class PacketLogger:
     }
 
 
+    self.metric('Logger Start', self._start_time)
+    self._out.write(_format_metric_name('Logger Start'))
+    self._out.write('{}\n'.format(self._start_time))
+    self._write_entry_end()
+
+
   def _handle_arp(self, arp_pkt):
     self.metric('ARP', [
       ('Opcode', PacketLogger._arp_opcode_to_name[arp_pkt.opcode]),
+      ('Hardware Source', arp_pkt.hwsrc),
       ('Protocol Source', arp_pkt.protosrc),
+      ('Hardware Dest.', arp_pkt.hwdst),
       ('Protocol Dest.', arp_pkt.protodst)
     ])
 
@@ -82,20 +99,55 @@ class PacketLogger:
     ])
 
 
+  def _raise_exception(self, ex):
+    self._out.write('{}{}\n'.format(_format_metric_name('Exception'), ex.message))
+    self._out.flush()
+    raise ex
+
+
+  def _write_packet(self):
+    self.metric('EOP', ('Implicit', self._is_in_packet))
+
+    for name in self._metrics_order:
+      fields = self._metrics[name]
+      self._out.write(_format_metric_name(name))
+      for field, value in fields:
+        if field is None:
+          self._out.write(str(value) + '; ')
+        else:
+          self._out.write('{} = {}; '.format(field, str(value)))
+      self._out.write('\n')
+    self._write_entry_end()
+
+
+  def _write_entry_end(self):
+    self._out.write('-' * 20)
+    self._out.write('\n')
+    self._out.flush()
+
+
   """
   Starts a new packet entry in the log and records packet attributes.
   """
-  def new_packet(self, dpid, in_port, ether_pkt):
+  def new_packet(self, dpid, of_packet_in, ether_pkt):
     if not self._is_open:
-      raise Exception('Packet logger is closed.')
+      self._raise_exception(Exception('Packet logger is closed.'))
 
-    self._out.write('-' * 20)
-    self._out.write('\n')
+    if self._is_in_packet:
+      self._write_packet()
+    self._is_in_packet = True
+
+    self._metrics.clear()
+    self._metrics_order = []
+
     self.metric('Timestamp', datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f'))
+    self.metric('Start Time', time() - self._start_time)
     self.metric('Hardware', [
       ('Switch', dpid),
-      ('In Port', in_port)
+      ('In Port', of_packet_in.in_port),
+      ('Buffer ID', of_packet_in.buffer_id)
     ])
+
     self.metric('Ethernet', [
       ('Source MAC', ether_pkt.src),
       ('Dest MAC', ether_pkt.dst),
@@ -112,19 +164,20 @@ class PacketLogger:
   """
   def metric(self, name, value):
     if not self._is_open:
-      raise Exception('Packet logger is closed.')
+      self._raise_exception(Exception('Packet logger is closed.'))
 
-    self._out.write('{:<20}'.format(name + ':'))
+    fields = self._metrics.get(name)
+    if fields is None:
+      fields = []
+      self._metrics[name] = fields
+      self._metrics_order.append(name)
+
     if isinstance(value, list):
-      for kv in value:
-        if kv[0] is None:
-          self._out.write(kv[1] + '; ')
-        else:
-          self._out.write('{} = {}; '.format(kv[0], str(kv[1])))
-      self._out.write('\n')
+      fields.extend(value)
+    elif isinstance(value, tuple):
+      fields.append(value)
     else:
-      self._out.write('{}\n'.format(value))
-    self._out.flush()
+      fields.append((None, value))
 
 
   """
@@ -132,7 +185,7 @@ class PacketLogger:
   """
   def action(self, action, description):
     if not self._is_open:
-      raise Exception('Packet logger is closed.')
+      self._raise_exception(Exception('Packet logger is closed.'))
 
     values = [ (None, action) ]
     if isinstance(description, list):
@@ -144,11 +197,23 @@ class PacketLogger:
 
 
   """
+  Logs the end of the processing of a packet.
+  """
+  def end_packet(self):
+    if self._is_in_packet:
+      self._is_in_packet = False
+      self._write_packet()
+
+
+  """
   Closes the packet logger.
   """
   def close(self):
     if self._is_open:
       try:
+        if self._is_in_packet:
+          self.end_packet()
+
         self._out.close()
       finally:
         self._is_open = False

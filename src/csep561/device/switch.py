@@ -104,8 +104,6 @@ class Switch():
     self.listenTo(self.connection)
 
     # Install a rule routing all ARP requests through the controller.
-    Switch.logger.info('Installing ARP => CONTROLLER flow rule on switch {}/{}.'.format(self.dpid, self.event.dpid))
-    Switch.logger.info('Correct connection? {}'.format('yes' if self.event.connection is self.connection else 'no'))
     msg = of.ofp_flow_mod(priority = 100)
     msg.match = of.ofp_match(dl_type = ethernet.ARP_TYPE)
     msg.actions.append(of.ofp_action_output(port = of.OFPP_CONTROLLER))

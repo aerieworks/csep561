@@ -1,12 +1,29 @@
+from pox.core import core
 from pox.lib.addresses import EthAddr, IPAddr
+from pox.lib.revent import Event, EventMixin
+
+
+"""
+Event raised when an address is added to the ARP table.
+"""
+class ArpEntryAddedEvent(Event):
+
+  def __init__(self, ip, mac):
+    super(ArpEntryAddedEvent, self).__init__()
+    self.ip = ip
+    self.mac = mac
 
 
 """
 An ARP table cache, mapping IP addresses to Ethernet MAC addresses.
 """
-class ArpTable:
+class ArpTable(EventMixin):
 
-  def __init__(self):
+  logger = core.getLogger()
+  _eventMixin_events = set([ ArpEntryAddedEvent ])
+
+  def __init__(self, name):
+    self.name = name
     self._ip_to_mac = {}
 
   def add(self, ip, mac):
@@ -14,7 +31,13 @@ class ArpTable:
       # Do not put "special" IP or MAC addresses in the ARP table.
       return
 
-    self._ip_to_mac[str(ip)] = EthAddr(mac)
+    ip_key = str(ip)
+    mac_value = EthAddr(mac)
+    old_mac = self._ip_to_mac.get(ip_key)
+    if old_mac != mac_value:
+      self._ip_to_mac[ip_key] = mac_value
+      ArpTable.logger.debug('{}: Added entry {} => {}'.format(self.name, ip_key, str(mac)))
+      self.raiseEvent(ArpEntryAddedEvent, IPAddr(ip), mac_value)
 
 
   def lookup(self, ip):
@@ -48,10 +71,13 @@ class SpecialMacs:
   # Broadcast MAC address instructing switches not to forward (see IEEE 802.1AB-2009).
   LLDP_BROADCAST = EthAddr('01:80:c2:00:00:0e')
 
-  # Target MAC address to use when sending an ARP request.
-  ARP_REQUEST_TARGET = EthAddr('ff:ff:ff:ff:ff:ff')
+  # Hardware destination for ARP requests.
+  ARP_REQUEST_DESTINATION = EthAddr('00:00:00:00:00:00')
 
-  all = set([ LLDP_BROADCAST, ARP_REQUEST_TARGET ])
+  # Target MAC address to use when sending an ARP request.
+  BROADCAST = EthAddr('ff:ff:ff:ff:ff:ff')
+
+  all = set([ LLDP_BROADCAST, ARP_REQUEST_DESTINATION, BROADCAST ])
 
 def is_special_mac(mac):
   for special_mac in SpecialMacs.all:
