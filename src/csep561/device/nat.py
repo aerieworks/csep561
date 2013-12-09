@@ -17,6 +17,10 @@ CONFIG_KEY_GATEWAY = 'gateway'
 CONFIG_KEY_NETMASK = 'netmask'
 CONFIG_KEY_IP = 'ip'
 CONFIG_KEY_UPLINK = 'uplink'
+CONFIG_KEY_PORT_MAP = 'port_map'
+CONFIG_KEY_PORT_MAP_IP = 'ip'
+CONFIG_KEY_PORT_MAP_PORT = 'port'
+CONFIG_KEY_PORT_MAP_NAT_PORT = 'nat_port'
 
 
 def ip_to_network(ip, netmask):
@@ -126,7 +130,6 @@ class NatRouter(LearningSwitch):
     #  - Keys are TCP port numbers as integers.
     #  - Values are (<IP Address>, <TCP Port>) tuples.
     self._inbound_nat_map = {}
-
     # The next TCP port available for NAT mapping.
     self._next_nat_tcp_port = 2000
 
@@ -139,6 +142,7 @@ class NatRouter(LearningSwitch):
     self._pending_packets = {}
 
     super(NatRouter, self).__init__(event)
+    self._initialize_nat_mappings(config[CONFIG_KEY_PORT_MAP])
 
 
   def _initialize(self):
@@ -256,11 +260,17 @@ class NatRouter(LearningSwitch):
         nw_src = self._network_filter)))
 
 
+  def _initialize_nat_mappings(self, config):
+    if config:
+      for mapping in config:
+        self._create_nat_mapping(mapping[CONFIG_KEY_PORT_MAP_IP], mapping[CONFIG_KEY_PORT_MAP_PORT], nat_tcp_port = mapping[CONFIG_KEY_PORT_MAP_NAT_PORT])
+
+
   """
   Gets the NAT TCP port assignment for a local IP address and TCP port.
   """
   def _get_outbound_nat_mapping(self, ip, tcp_port):
-    return self._outbound_nat_map.get((ip, tcp_port))
+    return self._outbound_nat_map.get((str(ip), tcp_port))
 
 
   """
@@ -273,10 +283,16 @@ class NatRouter(LearningSwitch):
   """
   Create a NAT mapping for the specified IP address and TCP port.
   """
-  def _create_nat_mapping(self, ip, tcp_port):
-    nat_tcp_port = self._next_nat_tcp_port
-    self._next_nat_tcp_port += 1
-    mapping = (ip, tcp_port)
+  def _create_nat_mapping(self, ip, tcp_port, nat_tcp_port = None):
+    if nat_tcp_port is None:
+      nat_tcp_port = self._next_nat_tcp_port
+      self._next_nat_tcp_port += 1
+    elif nat_tcp_port in self._inbound_nat_map:
+      raise Exception('NAT port {} already mapped.'.format(nat_tcp_port))
+    elif nat_tcp_port == self._next_nat_tcp_port:
+      self._next_nat_tcp_port += 1
+
+    mapping = (str(ip), tcp_port)
     self._outbound_nat_map[mapping] = nat_tcp_port
     self._inbound_nat_map[nat_tcp_port] = mapping
     self._packet_logger.action('NAT Mapping', [
@@ -352,6 +368,12 @@ class NatRouter(LearningSwitch):
     if nat_tcp_port is None:
       # Create NAT mapping.
       nat_tcp_port = self._create_nat_mapping(ip_pkt.srcip, tcp_pkt.srcport)
+    else:
+      self._packet_logger.metric('NAT Mapping', [
+        ('Local IP', ip_pkt.srcip),
+        ('Local TCP Port', tcp_pkt.srcport),
+        ('NAT TCP Port', nat_tcp_port)
+      ])
 
     msg = of.ofp_packet_out(data = event.ofp)
     if tcp_pkt.ACK and not tcp_pkt.SYN:
@@ -377,6 +399,12 @@ class NatRouter(LearningSwitch):
       return
 
     local_ip, local_port = mapping
+    self._packet_logger.metric('NAT Mapping', [
+      ('Local IP', local_ip),
+      ('Local TCP Port', local_port),
+      ('NAT TCP Port', tcp_pkt.dstport)
+    ])
+
     local_mac = self._arp_table.lookup(local_ip)
     if local_mac is None:
       self._queue_and_arp(event, local_ip)

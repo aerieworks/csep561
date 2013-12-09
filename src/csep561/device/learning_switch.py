@@ -98,13 +98,13 @@ class LearningSwitch(EventMixin):
   """
   def _handle_arp(self, event, ether_pkt, arp_pkt):
     # Update the ARP table with the info for the sender.
-    self._packet.logger.action('Add ARP Entry', [
+    self._packet_logger.action('Add ARP Entry', [
       ('IP Address', arp_pkt.protosrc), ('MAC Address', arp_pkt.hwsrc)
     ])
     self._arp_table.add(arp_pkt.protosrc, arp_pkt.hwsrc)
     if not is_special_mac(arp_pkt.hwdst):
       # If the hardware destination is a normal MAC address, add it to the ARP table.
-      self._packet.logger.action('Add ARP Entry', [
+      self._packet_logger.action('Add ARP Entry', [
         ('IP Address', arp_pkt.protodst), ('MAC Address', arp_pkt.hwdst)
       ])
       self._arp_table.add(arp_pkt.protodst, arp_pkt.hwdst)
