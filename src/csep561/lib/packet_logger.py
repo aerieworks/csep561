@@ -1,11 +1,31 @@
 from datetime import datetime
 from time import time
 
-from pox.lib.packet import arp, chassis_id, ethernet, ipv4, lldp, port_id
+from pox.lib.packet import arp, chassis_id, ethernet, ipv4, lldp, port_id, tcp
 
 def _format_metric_name(name):
   return '{:<20}'.format(name + ':')
 
+
+def _normalize_fields(fields, default_field = None):
+  if isinstance(fields, list):
+    return fields
+  elif isinstance(fields, tuple):
+    return [ fields ]
+  else:
+    return [ (str(default_field), fields) ]
+
+
+_tcp_flags = [
+  (tcp.FIN_flag, 'FIN'),
+  (tcp.SYN_flag, 'SYN'),
+  (tcp.RST_flag, 'RST'),
+  (tcp.PSH_flag, 'PSH'),
+  (tcp.ACK_flag, 'ACK'),
+  (tcp.URG_flag, 'URG'),
+  (tcp.ECN_flag, 'ECN'),
+  (tcp.CWR_flag, 'CWR')
+]
 
 class PacketLogger:
 
@@ -25,6 +45,7 @@ class PacketLogger:
     self._start_time = time()
     self._metrics = {}
     self._metrics_order = []
+    self._actions = []
     self._is_in_packet = False
     self._is_open = False
     self._out = open(file_name, 'a')
@@ -93,9 +114,15 @@ class PacketLogger:
 
 
   def _handle_tcp(self, tcp_pkt):
+    set_flags = filter(lambda x: tcp_pkt.flags & x[0], _tcp_flags)
     self.metric('TCP', [
       ('Source Port', tcp_pkt.srcport),
-      ('Dest Port', tcp_pkt.dstport)
+      ('Dest Port', tcp_pkt.dstport),
+      ('Flags', ' '.join([x[1] for x in set_flags])),
+      ('Seq', tcp_pkt.seq),
+      ('Ack', tcp_pkt.ack),
+      ('Offset', tcp_pkt.off),
+      ('Window', tcp_pkt.win)
     ])
 
 
@@ -106,21 +133,27 @@ class PacketLogger:
 
 
   def _write_packet(self):
-    self.metric('EOP', ('Implicit', self._is_in_packet))
-
     for name in self._metrics_order:
-      fields = self._metrics[name]
-      self._out.write(_format_metric_name(name))
-      for field, value in fields:
-        if field is None:
-          self._out.write(str(value) + '; ')
-        else:
-          self._out.write('{} = {}; '.format(field, str(value)))
-      self._out.write('\n')
+      self._write_metric(name, self._metrics[name])
+
+    for fields in self._actions:
+      self._write_metric('Action', fields)
+
     self._write_entry_end()
 
 
+  def _write_metric(self, name, fields):
+    self._out.write(_format_metric_name(name))
+    for field, value in fields:
+      if field is None:
+        self._out.write(str(value) + '; ')
+      else:
+        self._out.write('{} = {}; '.format(field, str(value)))
+    self._out.write('\n')
+
+
   def _write_entry_end(self):
+    self._write_metric('EOP', ['Explicit'] if self._is_in_packet else [])
     self._out.write('-' * 20)
     self._out.write('\n')
     self._out.flush()
@@ -139,6 +172,7 @@ class PacketLogger:
 
     self._metrics.clear()
     self._metrics_order = []
+    self._actions = []
 
     self.metric('Timestamp', datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f'))
     self.metric('Start Time', time() - self._start_time)
@@ -172,28 +206,20 @@ class PacketLogger:
       self._metrics[name] = fields
       self._metrics_order.append(name)
 
-    if isinstance(value, list):
-      fields.extend(value)
-    elif isinstance(value, tuple):
-      fields.append(value)
-    else:
-      fields.append((None, value))
+    fields.extend(_normalize_fields(value))
 
 
   """
   Logs an action being taken on a packet, and a description/reason.
   """
-  def action(self, action, description):
+  def action(self, action, value = None):
     if not self._is_open:
       self._raise_exception(Exception('Packet logger is closed.'))
 
-    values = [ (None, action) ]
-    if isinstance(description, list):
-      values.extend(description)
-    else:
-      values.append(('Description', description))
-
-    self.metric('Action', values)
+    fields = [ (None, action) ]
+    if value is not None:
+      fields.extend(_normalize_fields(value, default_field = 'Description'))
+    self._actions.append(fields)
 
 
   """
