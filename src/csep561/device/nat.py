@@ -1,17 +1,27 @@
+from random import randint
 from time import time
 
 import pox.openflow.libopenflow_01 as of
 from pox.core import core
 from pox.lib.addresses import EthAddr, IPAddr
 from pox.lib.packet import arp, ethernet, ipv4
+from pox.lib.recoco import Timer
 
 from .learning_switch import LearningSwitch
 from ..lib.addresses import SpecialMacs
 from ..lib.packet_logger import PacketLogger
 
 
-# How long a NAT flow table rule must go idle before it times out.
-NAT_RULE_IDLE_TIMEOUT = 7440
+# How long a NAT connection must be idle before it can be cleaned up.
+NAT_ESTABLISHED_IDLE_TIMEOUT = 7440 # seconds; 2 hours and 4 minutes
+NAT_TRANSIENT_IDLE_TIMEOUT = 300 # seconds; 5 minutes
+
+# How long to wait between sweeps of the NAT table for transient idle connections.
+NAT_TABLE_TRANSIENT_SWEEP_PERIOD = 10 # seconds
+
+# Cookie values to set on NAT rules (values chosen arbitrarily).
+NAT_INBOUND_RULE_COOKIE = 437
+NAT_OUTBOUND_RULE_COOKIE = 438
 
 CONFIG_KEY_GATEWAY = 'gateway'
 CONFIG_KEY_NETMASK = 'netmask'
@@ -27,20 +37,44 @@ def ip_to_network(ip, netmask):
   return IPAddr(ip.toUnsigned() & netmask.toUnsigned())
 
 
+def _make_nat_key(ip, port):
+  return (str(ip), port)
+
+
 class NatTable():
 
-  def __init__(self, packet_logger, start_port = 1024, port_map = None):
+  logger = core.getLogger()
+
+  def __init__(self, packet_logger, min_port = 1024, max_port = 65535, port_map = None):
     self._packet_logger = packet_logger
-    self._start_port = start_port
-    self._next_port = self._start_port
-    self._port_to_local = {}
-    self._local_to_port = {}
+    self._min_port = min_port
+    self._max_port = max_port
+    self._available_ports = range(min_port, max_port + 1)
+    self._port_mapping = {}
+    self._local_mapping = {}
     self._connections = {}
 
     if port_map:
       for mapping in port_map:
         self.add_port_mapping(mapping[CONFIG_KEY_PORT_MAP_IP], mapping[CONFIG_KEY_PORT_MAP_PORT], nat_port = mapping[CONFIG_KEY_PORT_MAP_NAT_PORT])
 
+    Timer(NAT_TABLE_TRANSIENT_SWEEP_PERIOD, self._sweep_for_transients, recurring = True)
+
+  def _sweep_for_transients(self):
+    NatTable.logger.debug('Sweeping NAT table for idle transient connections.')
+    for mapping in self._port_mapping.values():
+      remaining_conns = mapping.clean_up_idle_transients()
+      if remaining_conns == 0:
+        self._clean_up_mapping(mapping)
+
+  def _clean_up_mapping(self, mapping):
+    if not mapping.is_dynamic:
+      NatTable.logger.info('Not cleaning up static mapping: {}:{} => {}.'.format(mapping.local_ip, mapping.local_port, mapping.nat_port))
+      return
+    self._port_mapping.pop(mapping.nat_port)
+    self._local_mapping.pop(_make_nat_key(mapping.local_ip, mapping.local_port))
+    self._available_ports.append(mapping.nat_port)
+    NatTable.logger.info('Cleaned up mapping: {}:{} => {}'.format(mapping.local_ip, mapping.local_port, mapping.nat_port))
 
   """
   Registers a NAT mapping between the specified local IP address and TCP port and
@@ -50,26 +84,32 @@ class NatTable():
   def add_port_mapping(self, local_ip, local_port, nat_port = None):
     is_dynamic = False
     if nat_port is None:
-      # Use the next available NAT TCP port.
-      nat_port = self._next_port
-      self._next_port += 1
+      # Dynamically select an unmapped port and assign it to this mapping.
+
+      # Make sure we have an unmapped port available.
+      available_port_count = len(self._available_ports)
+      if available_port_count == 0:
+        raise Exception('Cannot map dynamic port: no unmapped ports available.')
+
+      # Select a random port.
+      port_index = randint(0, available_port_count - 1)
+      nat_port = self._available_ports.pop(port_index)
       is_dynamic = True
-    elif nat_port in self._port_to_local:
+    elif nat_port in self._port_mapping:
       # The specified NAT TCP port is already mapped.
       raise Exception('NAT port {} already mapped.'.format(nat_port))
-    elif nat_port == self._next_port:
-      # The specified NAT TCP port happens to be the next one we will assign, so
-      # advance to the next port.
-      self._next_port += 1
+    elif nat_port >= self._min_port and nat_port <= self._max_port:
+      # Remove the specified port from the list of available ports.
+      self._available_ports.remove(nat_port)
 
     self._packet_logger.action('Map NAT Port', [
       ('Local IP', local_ip), ('Local Port', local_port),
       ('NAT Port', nat_port), ('Dynamic', is_dynamic)
     ])
-    self._port_to_local[nat_port] = (IPAddr(local_ip), local_port)
-    self._local_to_port[(str(local_ip), local_port)] = nat_port
-    return nat_port
-
+    mapping = NatMapping(self._packet_logger, local_ip, local_port, nat_port, is_dynamic)
+    self._port_mapping[nat_port] = mapping
+    self._local_mapping[_make_nat_key(local_ip, local_port)] = mapping
+    return mapping
 
   """
   Gets the NAT connection associated with either the specified:
@@ -79,37 +119,80 @@ class NatTable():
   def get_connection(self, *params):
     if len(params) == 3:
       (remote_ip, remote_port, nat_port) = params
-      mapping = self._port_to_local.get(nat_port)
+      mapping = self._port_mapping.get(nat_port)
       if mapping is None:
         # No port mapping, and we cannot create one from the remote side.
         return None
-      local_ip, local_port = mapping
       self._packet_logger.metric('NAT Port Mapping', [
-        ('Local IP', local_ip), ('Local Port', local_port), ('NAT Port', nat_port)
+        ('Local IP', mapping.local_ip), ('Local Port', mapping.local_port), ('NAT Port', mapping.nat_port)
       ])
     elif len(params) == 4:
       local_ip, local_port, remote_ip, remote_port = params
-      nat_port = self._local_to_port.get((str(local_ip), local_port))
-      if nat_port is None:
+      mapping = self._local_mapping.get(_make_nat_key(local_ip, local_port))
+      if mapping is None:
         # No port mapping, so create one.
-        nat_port = self.add_port_mapping(local_ip, local_port)
+        mapping = self.add_port_mapping(local_ip, local_port)
       else:
         self._packet_logger.metric('NAT Port Mapping', [
-          ('Local IP', local_ip), ('Local Port', local_port), ('NAT Port', nat_port)
+          ('Local IP', mapping.local_ip), ('Local Port', mapping.local_port), ('NAT Port', mapping.nat_port)
         ])
     else:
       raise Exception('NatTable.get_connection() requires either 3 or 4 parameters ({} provided).'.format(len(params)))
 
-    # Get the connection for this remote address/port and this NAT port.
-    conn_key = (str(remote_ip), remote_port, nat_port)
+    # Get the connection for this remote address/port.
+    return mapping.get_connection(remote_ip, remote_port)
+
+  """
+  Cleans up the NAT table and releases any resources related to a now closed connection, also releasing
+  the NAT port mapping if it was dynamically assigned and has no further active connections.
+  """
+  def clean_up_connection(self, *params):
+    if len(params) == 3:
+      (remote_ip, remote_port, nat_port) = params
+      mapping = self._port_mapping.get(nat_port)
+    elif len(params) == 4:
+      local_ip, local_port, remote_ip, remote_port = params
+      mapping = self._local_mapping.get(_make_nat_key(local_ip, local_port))
+    else:
+      raise Exception('NatTable.clean_up_connection() requires either 3 or 4 parameters ({} provided).'.format(len(params)))
+
+    if mapping is None:
+      return
+    conn_count = mapping.clean_up_connection(remote_ip, remote_port)
+    if conn_count == 0:
+      self._clean_up_mapping(mapping)
+
+
+"""
+Represents a NAT port to local IP and TCP port mapping, and the remote connections
+associated with it.
+"""
+class NatMapping:
+
+  logger = core.getLogger()
+
+  def __init__(self, packet_logger, local_ip, local_port, nat_port, is_dynamic):
+    self._packet_logger = packet_logger
+    self.local_ip = local_ip
+    self.local_port = local_port
+    self.nat_port = nat_port
+    self.is_dynamic = is_dynamic
+    self._connections = {}
+
+  """
+  Gets the NAT connection associated with the remote IP address and TCP port.
+  """
+  def get_connection(self, remote_ip, remote_port):
+    # Get the connection for this remote address/port.
+    conn_key = _make_nat_key(remote_ip, remote_port)
     conn = self._connections.get(conn_key)
     if conn is None:
       # No connection yet; create one.
       self._packet_logger.action('New NAT Connection', [
         ('Remote IP', remote_ip), ('Remote Port', remote_port),
-        ('NAT Port', nat_port)
+        ('NAT Port', self.nat_port)
       ])
-      conn = NatConnection(self._packet_logger, local_ip, local_port, remote_ip, remote_port, nat_port)
+      conn = NatConnection(self._packet_logger, self.local_ip, self.local_port, remote_ip, remote_port, self.nat_port)
       self._connections[conn_key] = conn
     else:
       self._packet_logger.metric('NAT Connection', [
@@ -117,6 +200,26 @@ class NatTable():
         ('NAT TCP Port', conn.nat_port), ('Established', conn.is_established())
       ])
     return conn
+
+  """
+  Checks for idle transient connections and removes them.
+  """
+  def clean_up_idle_transients(self):
+    now = time()
+    for conn in self._connections.values():
+      if not conn.is_established() and now - conn.start_time >= NAT_TRANSIENT_IDLE_TIMEOUT:
+        self.clean_up_connection(conn.remote_ip, conn.remote_port)
+    return len(self._connections)
+
+  """
+  Cleans up the NAT mapping and releases any resources related to a now closed connection.
+  Returns the number of active connections on the mapping.
+  """
+  def clean_up_connection(self, remote_ip, remote_port):
+    conn = self._connections.pop(_make_nat_key(remote_ip, remote_port), None)
+    if conn:
+      NatMapping.logger.info('Cleaned up connection: {}:{} => {} => {}:{}'.format(conn.local_ip, conn.local_port, conn.nat_port, conn.remote_ip, conn.remote_port))
+    return len(self._connections)
 
 
 class NatConnection:
@@ -481,7 +584,9 @@ class NatRouter(LearningSwitch):
 
     # Install a rule to route and translate inbound packets for this NATed connection.
     msg = of.ofp_flow_mod(priority = 200,
-      idle_timeout = NAT_RULE_IDLE_TIMEOUT,
+      cookie = NAT_INBOUND_RULE_COOKIE,
+      flags = of.OFPFF_SEND_FLOW_REM,
+      idle_timeout = NAT_ESTABLISHED_IDLE_TIMEOUT,
       match = of.ofp_match(
         in_port = self._uplink_port,
         dl_type = ethernet.IP_TYPE,
@@ -497,7 +602,9 @@ class NatRouter(LearningSwitch):
 
     # Install a rule to route and translate outbound packets for this NATed connection.
     msg = of.ofp_flow_mod(priority = 200,
-      idle_timeout = NAT_RULE_IDLE_TIMEOUT,
+      cookie = NAT_OUTBOUND_RULE_COOKIE,
+      flags = of.OFPFF_SEND_FLOW_REM,
+      idle_timeout = NAT_ESTABLISHED_IDLE_TIMEOUT,
       match = of.ofp_match(
         in_port = switch_port,
         dl_type = ethernet.IP_TYPE,
@@ -506,7 +613,8 @@ class NatRouter(LearningSwitch):
         nw_proto = ipv4.TCP_PROTOCOL,
         nw_src = nat_conn.local_ip,
         nw_dst = nat_conn.remote_ip,
-        tp_src = nat_conn.local_port))
+        tp_src = nat_conn.local_port,
+        tp_dst = nat_conn.remote_port))
     msg.actions = self._get_outbound_nat_actions(nat_conn, remote_mac)
     self.connection.send(msg)
 
@@ -556,6 +664,25 @@ class NatRouter(LearningSwitch):
       self._drop_packet(event, 'Packet intended for controller, no need to forward.')
     else:
       super(NatRouter, self)._handle_default(event, ether_pkt)
+
+
+  def _handle_FlowRemoved(self, event):
+    if event.idleTimeout:
+      reason = 'idle timeout'
+    elif event.hardTimeout:
+      reason = 'hard timeout'
+    elif event.deleted:
+      reason = 'deleted'
+    else:
+      reason = 'unknown'
+
+    NatRouter.logger.info('{}: Flow removed; Reason = {}; Cookie = {}; in_port = {}; nw_src = {}; nw_dst = {}; tp_src = {}; tp_dst = {};'.format(self.dpid, reason, event.ofp.cookie, event.ofp.match.in_port, event.ofp.match.nw_src, event.ofp.match.nw_dst, event.ofp.match.tp_src, event.ofp.match.tp_dst))
+    if event.ofp.cookie == NAT_INBOUND_RULE_COOKIE:
+      # Remove connection associated with this inbound NAT rule; identify connection by remote IP/port and NAT port.
+      self._nat_table.clean_up_connection(event.ofp.match.nw_src, event.ofp.match.tp_src, event.ofp.match.tp_dst)
+    elif event.ofp.cookie == NAT_OUTBOUND_RULE_COOKIE:
+      # Remove connection associated with this outbound NAT rule; identify connection by local IP/port and remote IP/port.
+      self._nat_table.clean_up_connection(event.ofp.match.nw_src, event.ofp.match.tp_src, event.ofp.match.nw_dst, event.ofp.match.tp_dst)
 
 
   def _handle_arp_table_ArpEntryAddedEvent(self, event):
