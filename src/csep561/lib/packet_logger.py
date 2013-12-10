@@ -122,7 +122,8 @@ class PacketLogger:
       ('Seq', tcp_pkt.seq),
       ('Ack', tcp_pkt.ack),
       ('Offset', tcp_pkt.off),
-      ('Window', tcp_pkt.win)
+      ('Window', tcp_pkt.win),
+      ('Data Length', len(tcp_pkt.payload))
     ])
 
 

@@ -29,7 +29,8 @@ def ip_to_network(ip, netmask):
 
 class NatTable():
 
-  def __init__(self, start_port = 1024, port_map = None):
+  def __init__(self, packet_logger, start_port = 1024, port_map = None):
+    self._packet_logger = packet_logger
     self._start_port = start_port
     self._next_port = self._start_port
     self._port_to_local = {}
@@ -47,10 +48,12 @@ class NatTable():
   available port will be used.
   """
   def add_port_mapping(self, local_ip, local_port, nat_port = None):
+    is_dynamic = False
     if nat_port is None:
       # Use the next available NAT TCP port.
       nat_port = self._next_port
       self._next_port += 1
+      is_dynamic = True
     elif nat_port in self._port_to_local:
       # The specified NAT TCP port is already mapped.
       raise Exception('NAT port {} already mapped.'.format(nat_port))
@@ -59,6 +62,10 @@ class NatTable():
       # advance to the next port.
       self._next_port += 1
 
+    self._packet_logger.action('Map NAT Port', [
+      ('Local IP', local_ip), ('Local Port', local_port),
+      ('NAT Port', nat_port), ('Dynamic', is_dynamic)
+    ])
     self._port_to_local[nat_port] = (IPAddr(local_ip), local_port)
     self._local_to_port[(str(local_ip), local_port)] = nat_port
     return nat_port
@@ -77,12 +84,19 @@ class NatTable():
         # No port mapping, and we cannot create one from the remote side.
         return None
       local_ip, local_port = mapping
+      self._packet_logger.metric('NAT Port Mapping', [
+        ('Local IP', local_ip), ('Local Port', local_port), ('NAT Port', nat_port)
+      ])
     elif len(params) == 4:
       local_ip, local_port, remote_ip, remote_port = params
       nat_port = self._local_to_port.get((str(local_ip), local_port))
       if nat_port is None:
         # No port mapping, so create one.
         nat_port = self.add_port_mapping(local_ip, local_port)
+      else:
+        self._packet_logger.metric('NAT Port Mapping', [
+          ('Local IP', local_ip), ('Local Port', local_port), ('NAT Port', nat_port)
+        ])
     else:
       raise Exception('NatTable.get_connection() requires either 3 or 4 parameters ({} provided).'.format(len(params)))
 
@@ -91,32 +105,98 @@ class NatTable():
     conn = self._connections.get(conn_key)
     if conn is None:
       # No connection yet; create one.
-      conn = NatConnection(local_ip, local_port, remote_ip, remote_port, nat_port)
+      self._packet_logger.action('New NAT Connection', [
+        ('Remote IP', remote_ip), ('Remote Port', remote_port),
+        ('NAT Port', nat_port)
+      ])
+      conn = NatConnection(self._packet_logger, local_ip, local_port, remote_ip, remote_port, nat_port)
       self._connections[conn_key] = conn
+    else:
+      self._packet_logger.metric('NAT Connection', [
+        ('Remote IP', conn.remote_ip), ('Remote TCP Port', conn.remote_port),
+        ('NAT TCP Port', conn.nat_port), ('Established', conn.is_established())
+      ])
     return conn
 
 
 class NatConnection:
 
-  def __init__(self, local_ip, local_port, remote_ip, remote_port, nat_port):
+  def __init__(self, packet_logger, local_ip, local_port, remote_ip, remote_port, nat_port):
+    self._packet_logger = packet_logger
     self.start_time = time()
     self.local_ip = IPAddr(local_ip)
     self.local_port = local_port
     self.remote_ip = IPAddr(remote_ip)
     self.remote_port = remote_port
     self.nat_port = nat_port
-    self._is_established = False
+    self._reset()
 
+  def _reset(self):
+    self._expected_syn_ack = { 'local': None, 'remote': None }
+    self._received_syn_ack = { 'local': False, 'remote': False }
+    self._is_established = False
+    self.is_installed = False
+
+  def _identify_src_and_dest(self, ip_pkt):
+    if ip_pkt.srcip == self.local_ip:
+      # Packet source is the local NATed host, destination is the remote host.
+      return ('local', 'remote')
+    else:
+      # Packet source is the remote host, destination is the local NATed host.
+      return ('remote', 'local')
 
   def update(self, ether_pkt, ip_pkt, tcp_pkt):
-    if self._is_established:
+    if self.is_installed:
+      # If the rules have already been installed, do nothing - not even reset. If
+      # we are still seeing packets, it is because they were already sent to us
+      # before the rule was installed on the switch. (race condition, but no ill
+      # effects)
+      return
+    if tcp_pkt.RST:
+      # TCP reset; throw out all of our expectations and start over.
+      self._packet_logger.action('Reset NAT connection')
+      self._reset()
+      return
+    elif self._is_established:
+      # Already established.  If we're still getting packets, it means we didn't
+      # know which port to use for the NAT host (weird!).  Don't bother to update;
+      # once the controller knows the port, it will install rules.
       return
 
-    if tcp_pkt.ACK and not tcp_pkt.SYN:
-      # ACKs that arn't SYN+ACKs only happen when moving to ESTABLISHED, or within later states.
-      # Since we only care about differentiating pre-ESTABLISHED TCP connections for timeout purposes,
-      # we can now treat this connection as ESTABLISHED.
+    src, dst = self._identify_src_and_dest(ip_pkt)
+    action = None
+    if tcp_pkt.SYN:
+      if tcp_pkt.ACK:
+        if tcp_pkt.ack == self._expected_syn_ack[dst]:
+          # This is a SYN+ACK for the last SYN received from the destination.
+          # Update destination state to indicate that its SYN has been ACKed.
+          self._received_syn_ack[dst] = True
+          action = 'Marked {} SYN+ACK as "received"'.format(dst)
+          if self._received_syn_ack[src] and self._received_syn_ack[dst]:
+            # Both sides have sent SYN+ACKs for the other side's SYN.
+            # Simultaneous open.
+            action = 'Established due to simultaneous open'
+            self._is_established = True
+      else:
+        # Just a SYN; update source state with the expected ACK.
+        self._expected_syn_ack[src] = tcp_pkt.seq + 1
+        self._received_syn_ack[src] = False
+        action = 'Set {} state from new SYN'.format(src)
+    elif tcp_pkt.ACK:
+      # ACKs that arn't SYN+ACKs only happen when moving to ESTABLISHED, or within
+      # later states.  We won't know if/when an established connection is closed or
+      # reset anyway, we may as well aggressively consider connections established.
+      action = 'Established due to ACK.'
       self._is_established = True
+
+    if action:
+      self._packet_logger.action(action, [
+        ('Packet Source', src),
+        ('Local Exp. SYN+ACK', self._expected_syn_ack['local']),
+        ('Local Recvd SYN+ACK', self._received_syn_ack['local']),
+        ('Remote Exp. SYN+ACK', self._expected_syn_ack['remote']),
+        ('Remote Recvd SYN+ACK', self._received_syn_ack['remote'])
+      ])
 
 
   def is_established(self):
@@ -137,9 +217,7 @@ class NatRouter(LearningSwitch):
     self._netmask = IPAddr(config[CONFIG_KEY_NETMASK])
     self._network = ip_to_network(self._gateway_ip, self._netmask)
     self._network_filter = '{}/{}'.format(self._network, self._netmask)
-
-    # The NAT mapping tables.
-    self._nat_table = NatTable(port_map = config[CONFIG_KEY_PORT_MAP])
+    self._config = config
 
     # A map of packets that are awaiting ARP replies; keys are destination IP
     # addresses, values are lists of queued packet events.
@@ -152,7 +230,11 @@ class NatRouter(LearningSwitch):
     super(NatRouter, self).__init__(event)
 
 
+
   def _initialize(self):
+    # The NAT mapping tables.
+    self._nat_table = NatTable(self._packet_logger, port_map = self._config[CONFIG_KEY_PORT_MAP])
+
     # Use a single MAC address for the NAT box.  We arbitrarily choose to use the
     # uplink port's address.
     uplink_mac = self._get_mac_for_port(self._uplink_port)
@@ -331,22 +413,16 @@ class NatRouter(LearningSwitch):
 
   def _handle_outbound_nat(self, event, ether_pkt, ip_pkt, tcp_pkt, remote_mac):
     nat_conn = self._nat_table.get_connection(ip_pkt.srcip, tcp_pkt.srcport, ip_pkt.dstip, tcp_pkt.dstport)
-    self._packet_logger.metric('NAT Connection', [
-      ('Packet Direction', 'Outbound'),
-      ('Local IP', nat_conn.local_ip),
-      ('Local TCP Port', nat_conn.local_port),
-      ('Remote IP', nat_conn.remote_ip),
-      ('Remote TCP Port', nat_conn.remote_port),
-      ('NAT TCP Port', nat_conn.nat_port)
-    ])
 
     # Update the NAT connection state from the outbound packet.
     nat_conn.update(ether_pkt, ip_pkt, tcp_pkt)
 
     msg = of.ofp_packet_out(data = event.ofp)
     if nat_conn.is_established():
-      # The connection is now ESTABLISHED, so let hand control over to flow table rules.
-      self._install_nat_rules(nat_conn, event.ofp.in_port, ether_pkt.src, remote_mac)
+      if not nat_conn.is_installed:
+        # The connection is now ESTABLISHED, so hand control over to flow table rules.
+        self._install_nat_rules(nat_conn, event.ofp.in_port, ether_pkt.src, remote_mac)
+        nat_conn.is_installed = True
 
       # Send the current packet according to the new flow table rules.
       msg.actions.append(of.ofp_action_output(port = of.OFPP_TABLE))
@@ -367,21 +443,28 @@ class NatRouter(LearningSwitch):
       self._drop_packet(event, 'Inbound TCP packet for unmapped port')
       return
 
-    self._packet_logger.metric('NAT Connection', [
-      ('Packet Direction', 'Inbound'),
-      ('Local IP', nat_conn.local_ip),
-      ('Local TCP Port', nat_conn.local_port),
-      ('Remote IP', nat_conn.remote_ip),
-      ('Remote TCP Port', nat_conn.remote_port),
-      ('NAT TCP Port', nat_conn.nat_port)
-    ])
-
     local_mac = self._arp_table.lookup(nat_conn.local_ip)
     if local_mac is None:
       self._queue_and_arp(event, nat_conn.local_ip)
       return
 
-    out_port = self.get_port_for_mac(local_mac) or of.OFPP_FLOOD
+    # Update the NAT connection state from the outbound packet.
+    nat_conn.update(ether_pkt, ip_pkt, tcp_pkt)
+
+    msg = of.ofp_packet_out(data = event.ofp)
+    out_port = self.get_port_for_mac(local_mac)
+    if nat_conn.is_established() and out_port is not None:
+      # The connection is now ESTABLISHED and we know where to find the
+      # destination NAT host, so hand control over to flow table rules.
+      self._install_nat_rules(nat_conn, out_port, local_mac, ether_pkt.src)
+
+      # Send the current packet according to the new flow table rules.
+      msg.actions.append(of.ofp_action_output(port = of.OFPP_TABLE))
+      self._packet_logger.action('Apply Flow Table')
+      return
+    elif out_port is None:
+      out_port = of.OFPP_FLOOD
+
     self._packet_logger.action('Translate and Forward', [ ('Out Port', out_port) ])
     msg = of.ofp_packet_out(data = event.ofp)
     msg.actions = self._get_inbound_nat_actions(nat_conn, local_mac, out_port)
