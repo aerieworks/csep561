@@ -1,3 +1,11 @@
+"""
+Author:     Annabelle Richard <richanna@u.washington.edu>
+Course:     CSEP 561 (Autumn, 2013)
+Professor:  Arvind Krishnamurthy
+
+NAT router implemented using the POX SDN library.
+"""
+
 from random import randint
 from time import time
 

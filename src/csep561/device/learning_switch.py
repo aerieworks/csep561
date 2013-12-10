@@ -1,3 +1,11 @@
+"""
+Author:     Annabelle Richard <richanna@u.washington.edu>
+Course:     CSEP 561 (Autumn, 2013)
+Professor:  Arvind Krishnamurthy
+
+Learning switch implemented using the POX SDN library.
+"""
+
 from traceback import format_exc
 
 import pox.openflow.libopenflow_01 as of
